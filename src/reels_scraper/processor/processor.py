@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from ..logger import get_logger
 from ..models import MarkdownReport, ReelMetadata, Transcript
+from ..progress import ProgressTracker
 from .ai_enhancer import AIEnhancer
 from .markdown_generator import MarkdownGenerator, load_reel_metadata_from_json
 
@@ -25,6 +26,9 @@ class ContentProcessor:
         max_summary_length: int = 500,
         extract_topics: bool = True,
         generate_summary: bool = True,
+        enable_resume: bool = True,
+        progress_file: Optional[Path] = None,
+        output_dir: Path = Path("./output/markdown"),
     ):
         """Initialize content processor.
 
@@ -35,6 +39,9 @@ class ContentProcessor:
             max_summary_length: Maximum summary length in words
             extract_topics: Whether to extract topics
             generate_summary: Whether to generate AI summary
+            enable_resume: Enable resume capability with progress tracking
+            progress_file: Custom path for progress file
+            output_dir: Output directory (for default progress file path)
         """
         self.ai_enhancer = AIEnhancer(
             api_key=google_api_key,
@@ -44,10 +51,12 @@ class ContentProcessor:
         self.markdown_generator = MarkdownGenerator(template=template)
         self.extract_topics = extract_topics
         self.generate_summary = generate_summary
+        self.enable_resume = enable_resume
+        self.progress_file = progress_file or (output_dir / ".processing_progress.json")
 
         logger.info(
             f"Content processor initialized: {ai_model}, template={template}, "
-            f"summary={generate_summary}, topics={extract_topics}"
+            f"summary={generate_summary}, topics={extract_topics}, resume={enable_resume}"
         )
 
     def process_transcript(
@@ -102,7 +111,7 @@ class ContentProcessor:
         reels_metadata: Optional[Dict[str, ReelMetadata]] = None,
         show_progress: bool = True,
     ) -> List[MarkdownReport]:
-        """Process multiple transcripts.
+        """Process multiple transcripts with resume capability.
 
         Args:
             transcripts: List of Transcript objects
@@ -117,11 +126,37 @@ class ContentProcessor:
         reports = []
         failed_count = 0
 
+        # Initialize progress tracker if resume enabled
+        tracker = None
+        transcripts_to_process = transcripts
+
+        if self.enable_resume:
+            # Create or load progress tracker
+            item_ids = [t.video_id for t in transcripts]
+            tracker = ProgressTracker.create_or_load(
+                stage="processing",
+                file_path=self.progress_file,
+                item_ids=item_ids,
+            )
+
+            # Get resumable items
+            resumable_ids = set(tracker.get_resumable_items())
+
+            # Filter transcripts to only process resumable ones
+            transcripts_to_process = [t for t in transcripts if t.video_id in resumable_ids]
+
+            if len(transcripts_to_process) < len(transcripts):
+                already_done = len(transcripts) - len(transcripts_to_process)
+                logger.info(
+                    f"Resuming processing: {already_done} already completed, "
+                    f"{len(transcripts_to_process)} remaining"
+                )
+
         # Create progress bar
         progress_bar = None
         if show_progress:
             progress_bar = tqdm(
-                total=len(transcripts),
+                total=len(transcripts_to_process),
                 desc="Processing transcripts",
                 unit="transcript",
                 dynamic_ncols=True,
@@ -129,14 +164,27 @@ class ContentProcessor:
 
         try:
             # Process transcripts sequentially (Gemini API has rate limits)
-            for transcript in transcripts:
+            for transcript in transcripts_to_process:
                 try:
+                    # Mark as in progress
+                    if tracker:
+                        tracker.start_item(transcript.video_id)
+                        tracker.save(self.progress_file)
+
                     reel = None
                     if reels_metadata:
                         reel = reels_metadata.get(transcript.video_id)
 
                     report = self.process_transcript(transcript, reel)
                     reports.append(report)
+
+                    # Mark as complete
+                    if tracker:
+                        tracker.complete_item(
+                            transcript.video_id,
+                            {"title": report.title, "topics": report.topics},
+                        )
+                        tracker.save(self.progress_file)
 
                     if progress_bar:
                         progress_bar.set_postfix_str(f"✓ {transcript.video_id[:8]}")
@@ -146,6 +194,11 @@ class ContentProcessor:
                     failed_count += 1
                     logger.error(f"Failed to process transcript {transcript.video_id}: {e}")
 
+                    # Mark as failed
+                    if tracker:
+                        tracker.fail_item(transcript.video_id, str(e))
+                        tracker.save(self.progress_file)
+
                     if progress_bar:
                         progress_bar.set_postfix_str(f"✗ {transcript.video_id[:8]}")
                         progress_bar.update(1)
@@ -153,6 +206,12 @@ class ContentProcessor:
         finally:
             if progress_bar:
                 progress_bar.close()
+
+            # Mark stage as complete
+            if tracker:
+                tracker.complete()
+                tracker.save(self.progress_file)
+                logger.info(f"Progress saved to {self.progress_file}")
 
         logger.info(
             f"Batch processing complete: {len(reports)} successful, {failed_count} failed"

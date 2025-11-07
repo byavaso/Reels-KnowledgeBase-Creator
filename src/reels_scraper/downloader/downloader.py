@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from ..logger import get_logger
 from ..models import DownloadReport, DownloadStatus, ReelMetadata
+from ..progress import ProgressTracker
 
 logger = get_logger(__name__)
 
@@ -26,6 +27,8 @@ class VideoDownloader:
         retry_delay: float = 5.0,
         output_dir: Path = Path("./output/downloads"),
         skip_existing: bool = True,
+        enable_resume: bool = True,
+        progress_file: Optional[Path] = None,
     ):
         """Initialize video downloader.
 
@@ -35,19 +38,23 @@ class VideoDownloader:
             retry_delay: Initial delay for retry in seconds (exponential backoff)
             output_dir: Directory to save downloaded videos
             skip_existing: Skip already downloaded videos
+            enable_resume: Enable resume capability with progress tracking
+            progress_file: Custom path for progress file (default: output_dir/.download_progress.json)
         """
         self.max_workers = max_workers
         self.retry_count = retry_count
         self.retry_delay = retry_delay
         self.output_dir = output_dir
         self.skip_existing = skip_existing
+        self.enable_resume = enable_resume
+        self.progress_file = progress_file or (output_dir / ".download_progress.json")
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(
             f"Video downloader initialized: {max_workers} workers, "
-            f"output: {output_dir}, retry: {retry_count}"
+            f"output: {output_dir}, retry: {retry_count}, resume: {enable_resume}"
         )
 
     def _get_video_path(self, reel: ReelMetadata) -> Path:
@@ -207,7 +214,7 @@ class VideoDownloader:
     def download_batch(
         self, reels: List[ReelMetadata], show_progress: bool = True
     ) -> DownloadReport:
-        """Download multiple videos concurrently.
+        """Download multiple videos concurrently with resume capability.
 
         Args:
             reels: List of Reel metadata
@@ -221,11 +228,37 @@ class VideoDownloader:
             total_videos=len(reels), started_at=datetime.now(), download_statuses=[]
         )
 
+        # Initialize progress tracker if resume enabled
+        tracker = None
+        reels_to_download = reels
+
+        if self.enable_resume:
+            # Create or load progress tracker
+            item_ids = [reel.video_id for reel in reels]
+            tracker = ProgressTracker.create_or_load(
+                stage="download",
+                file_path=self.progress_file,
+                item_ids=item_ids,
+            )
+
+            # Get resumable items (pending + failed in-progress)
+            resumable_ids = set(tracker.get_resumable_items())
+
+            # Filter reels to only download resumable ones
+            reels_to_download = [reel for reel in reels if reel.video_id in resumable_ids]
+
+            if len(reels_to_download) < len(reels):
+                already_done = len(reels) - len(reels_to_download)
+                logger.info(
+                    f"Resuming download: {already_done} already completed, "
+                    f"{len(reels_to_download)} remaining"
+                )
+
         # Create progress bar
         progress_bar = None
         if show_progress:
             progress_bar = tqdm(
-                total=len(reels),
+                total=len(reels_to_download),
                 desc="Downloading videos",
                 unit="video",
                 dynamic_ncols=True,
@@ -237,13 +270,18 @@ class VideoDownloader:
                 # Submit all download tasks
                 future_to_reel = {
                     executor.submit(self.download_single, reel, progress_bar): reel
-                    for reel in reels
+                    for reel in reels_to_download
                 }
 
                 # Process completed downloads
                 for future in as_completed(future_to_reel):
                     reel = future_to_reel[future]
                     try:
+                        # Mark as in progress
+                        if tracker:
+                            tracker.start_item(reel.video_id)
+                            tracker.save(self.progress_file)
+
                         status = future.result()
                         report.download_statuses.append(status)
 
@@ -251,19 +289,41 @@ class VideoDownloader:
                         if status.success:
                             if status.error_message == "Already downloaded (skipped)":
                                 report.skipped += 1
+                                if tracker:
+                                    tracker.skip_item(reel.video_id, "Already downloaded")
                             else:
                                 report.successful += 1
                                 report.total_size += status.file_size
+                                if tracker:
+                                    tracker.complete_item(
+                                        reel.video_id,
+                                        {"file_path": str(status.file_path), "file_size": status.file_size},
+                                    )
                         else:
                             report.failed += 1
+                            if tracker:
+                                tracker.fail_item(reel.video_id, status.error_message or "Unknown error")
+
+                        # Save progress after each item
+                        if tracker:
+                            tracker.save(self.progress_file)
 
                     except Exception as e:
                         logger.error(f"Error processing download result for {reel.shortcode}: {e}")
                         report.failed += 1
+                        if tracker:
+                            tracker.fail_item(reel.video_id, str(e))
+                            tracker.save(self.progress_file)
 
         finally:
             if progress_bar:
                 progress_bar.close()
+
+            # Mark stage as complete
+            if tracker:
+                tracker.complete()
+                tracker.save(self.progress_file)
+                logger.info(f"Progress saved to {self.progress_file}")
 
         # Finalize report
         report.completed_at = datetime.now()
