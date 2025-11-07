@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from ..logger import get_logger
 from ..models import Transcript
+from ..progress import ProgressTracker
 from .audio_extractor import AudioExtractor
 from .whisper_service import WhisperService
 
@@ -26,6 +27,9 @@ class TranscriptionEngine:
         language: str = "auto",
         max_workers: int = 2,
         include_timestamps: bool = True,
+        enable_resume: bool = True,
+        progress_file: Optional[Path] = None,
+        output_dir: Path = Path("./output/transcripts"),
     ):
         """Initialize transcription engine.
 
@@ -35,6 +39,9 @@ class TranscriptionEngine:
             language: Language code or 'auto' for detection
             max_workers: Number of concurrent transcription workers
             include_timestamps: Include timestamps in transcripts
+            enable_resume: Enable resume capability with progress tracking
+            progress_file: Custom path for progress file
+            output_dir: Output directory (for default progress file path)
         """
         self.audio_extractor = AudioExtractor()
         self.whisper_service = WhisperService(
@@ -44,6 +51,8 @@ class TranscriptionEngine:
         )
         self.max_workers = max_workers
         self.include_timestamps = include_timestamps
+        self.enable_resume = enable_resume
+        self.progress_file = progress_file or (output_dir / ".transcription_progress.json")
 
         # Check ffmpeg availability
         if not AudioExtractor.check_ffmpeg_installed():
@@ -51,7 +60,7 @@ class TranscriptionEngine:
 
         logger.info(
             f"Transcription engine initialized: {model}, "
-            f"language={language}, workers={max_workers}"
+            f"language={language}, workers={max_workers}, resume={enable_resume}"
         )
 
     def transcribe_video(
@@ -101,7 +110,7 @@ class TranscriptionEngine:
         show_progress: bool = True,
         cleanup_audio: bool = True,
     ) -> List[Transcript]:
-        """Transcribe multiple video files concurrently.
+        """Transcribe multiple video files concurrently with resume capability.
 
         Args:
             video_files: List of (video_path, video_id) tuples
@@ -116,11 +125,39 @@ class TranscriptionEngine:
         transcripts = []
         failed_count = 0
 
+        # Initialize progress tracker if resume enabled
+        tracker = None
+        files_to_process = video_files
+
+        if self.enable_resume:
+            # Create or load progress tracker
+            item_ids = [video_id for _, video_id in video_files]
+            tracker = ProgressTracker.create_or_load(
+                stage="transcription",
+                file_path=self.progress_file,
+                item_ids=item_ids,
+            )
+
+            # Get resumable items
+            resumable_ids = set(tracker.get_resumable_items())
+
+            # Filter videos to only process resumable ones
+            files_to_process = [
+                (path, vid) for path, vid in video_files if vid in resumable_ids
+            ]
+
+            if len(files_to_process) < len(video_files):
+                already_done = len(video_files) - len(files_to_process)
+                logger.info(
+                    f"Resuming transcription: {already_done} already completed, "
+                    f"{len(files_to_process)} remaining"
+                )
+
         # Create progress bar
         progress_bar = None
         if show_progress:
             progress_bar = tqdm(
-                total=len(video_files),
+                total=len(files_to_process),
                 desc="Transcribing videos",
                 unit="video",
                 dynamic_ncols=True,
@@ -137,7 +174,7 @@ class TranscriptionEngine:
                         video_id,
                         cleanup_audio,
                     ): (video_path, video_id)
-                    for video_path, video_id in video_files
+                    for video_path, video_id in files_to_process
                 }
 
                 # Process completed transcriptions
@@ -145,8 +182,24 @@ class TranscriptionEngine:
                     video_path, video_id = future_to_video[future]
 
                     try:
+                        # Mark as in progress
+                        if tracker:
+                            tracker.start_item(video_id)
+                            tracker.save(self.progress_file)
+
                         transcript = future.result()
                         transcripts.append(transcript)
+
+                        # Mark as complete
+                        if tracker:
+                            tracker.complete_item(
+                                video_id,
+                                {
+                                    "language": transcript.language,
+                                    "word_count": transcript.word_count,
+                                },
+                            )
+                            tracker.save(self.progress_file)
 
                         if progress_bar:
                             progress_bar.set_postfix_str(
@@ -158,6 +211,11 @@ class TranscriptionEngine:
                         failed_count += 1
                         logger.error(f"Transcription failed for {video_path}: {e}")
 
+                        # Mark as failed
+                        if tracker:
+                            tracker.fail_item(video_id, str(e))
+                            tracker.save(self.progress_file)
+
                         if progress_bar:
                             progress_bar.set_postfix_str(f"✗ {video_path.name}")
                             progress_bar.update(1)
@@ -165,6 +223,12 @@ class TranscriptionEngine:
         finally:
             if progress_bar:
                 progress_bar.close()
+
+            # Mark stage as complete
+            if tracker:
+                tracker.complete()
+                tracker.save(self.progress_file)
+                logger.info(f"Progress saved to {self.progress_file}")
 
         logger.info(
             f"Batch transcription complete: {len(transcripts)} successful, "

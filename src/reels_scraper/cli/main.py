@@ -452,16 +452,100 @@ def generate(
     default=None,
     help="Output directory for knowledge base",
 )
+@click.option(
+    "--organize-by-topic/--flat",
+    default=True,
+    help="Organize files by topics (default: True)",
+)
+@click.option(
+    "--create-zip",
+    is_flag=True,
+    default=False,
+    help="Create ZIP archive of knowledge base",
+)
+@click.option(
+    "--zip-name",
+    type=str,
+    default="knowledge-base.zip",
+    help="Name of ZIP archive",
+)
 @click.pass_context
 def index(
     ctx: click.Context,
     markdown_dir: Path,
     output_dir: Optional[Path],
+    organize_by_topic: bool,
+    create_zip: bool,
+    zip_name: str,
 ) -> None:
-    """Build knowledge base index from markdown files."""
+    """Build knowledge base index from markdown files.
+
+    Organizes markdown files by topics and creates a master index.md file.
+    Optionally creates a ZIP archive for NotebookLM or other tools.
+    """
+    from ..builder import KnowledgeBaseBuilder
+
+    config = ctx.obj["config"]
     logger = ctx.obj["logger"]
-    click.secho("Index command not yet implemented", fg="yellow")
-    logger.warning("Index functionality coming in Phase 6")
+
+    # Use config output dir if not specified
+    if not output_dir:
+        output_dir = config.knowledge_base.base_dir
+
+    logger.info(f"Building knowledge base from {markdown_dir}")
+
+    try:
+        click.echo(f"Building knowledge base from: {markdown_dir}")
+        click.echo(f"Output directory: {output_dir}")
+        click.echo(f"Organize by topic: {organize_by_topic}")
+        click.echo()
+
+        # Create knowledge base builder
+        builder = KnowledgeBaseBuilder(
+            markdown_dir=markdown_dir,
+            output_dir=output_dir,
+            organize_by_topic=organize_by_topic,
+            create_index=config.knowledge_base.create_index,
+        )
+
+        # Build knowledge base
+        builder.build()
+
+        # Save statistics
+        builder.save_stats()
+
+        # Create ZIP if requested
+        zip_path = None
+        if create_zip or config.knowledge_base.create_zip:
+            zip_name_to_use = zip_name if create_zip else config.knowledge_base.zip_name
+            zip_path = builder.create_zip_archive(zip_name_to_use)
+
+        # Display summary
+        click.echo()
+        click.secho("✓ Knowledge base built successfully!", fg="green", bold=True)
+        click.echo()
+        click.echo(f"Total Reels: {len(builder.markdown_files)}")
+        click.echo(f"Topics: {len(builder.topics_map)}")
+
+        if builder.topics_map:
+            click.echo("\nTopics breakdown:")
+            for topic in sorted(builder.topics_map.keys()):
+                count = len(builder.topics_map[topic])
+                click.echo(f"  • {topic}: {count} reels")
+
+        click.echo()
+        click.echo(f"Knowledge base: {output_dir}")
+        click.echo(f"Index file: {output_dir}/index.md")
+        click.echo(f"Statistics: {output_dir}/stats.json")
+
+        if zip_path:
+            zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
+            click.echo(f"ZIP archive: {zip_path} ({zip_size_mb:.2f} MB)")
+
+    except Exception as e:
+        logger.exception("Knowledge base building failed")
+        click.secho(f"✗ Knowledge base building failed: {e}", fg="red", err=True)
+        ctx.exit(1)
 
 
 @cli.command()
@@ -487,13 +571,14 @@ def full(
     workers: int,
     skip_existing: bool,
 ) -> None:
-    """Run complete pipeline: scrape → download → transcribe → generate.
+    """Run complete pipeline: scrape → download → transcribe → generate → index.
 
     This command runs all stages of the pipeline sequentially:
     1. Scrape Instagram profile for Reels metadata
     2. Download videos
     3. Transcribe videos using Whisper API
     4. Generate markdown reports with AI enhancement
+    5. Build organized knowledge base with index
     """
     from ..downloader import VideoDownloader
     from ..processor import ContentProcessor, load_reel_metadata_from_json
@@ -637,6 +722,35 @@ def full(
         click.secho(f"✓ Generated {len(reports)} markdown reports", fg="green")
         click.echo()
 
+        # ==================== STAGE 5: KNOWLEDGE BASE BUILDING ====================
+        click.secho("Stage 5: Building Knowledge Base", fg="blue", bold=True)
+        click.echo("-" * 50)
+
+        from ..builder import KnowledgeBaseBuilder
+
+        kb_dir = output_dir / "knowledge-base"
+
+        builder = KnowledgeBaseBuilder(
+            markdown_dir=markdown_dir,
+            output_dir=kb_dir,
+            organize_by_topic=config.knowledge_base.organize_by_topic,
+            create_index=config.knowledge_base.create_index,
+        )
+
+        builder.build()
+        builder.save_stats()
+
+        # Create ZIP if configured
+        zip_path = None
+        if config.knowledge_base.create_zip:
+            zip_path = builder.create_zip_archive(config.knowledge_base.zip_name)
+
+        click.secho(
+            f"✓ Knowledge base built with {len(builder.topics_map)} topics",
+            fg="green",
+        )
+        click.echo()
+
         # ==================== FINAL SUMMARY ====================
         click.echo()
         click.secho("=" * 70, fg="cyan")
@@ -651,12 +765,16 @@ def full(
         click.echo(f"  • Videos downloaded: {download_report.successful}")
         click.echo(f"  • Transcripts:       {len(transcripts)}")
         click.echo(f"  • Markdown reports:  {len(reports)}")
+        click.echo(f"  • Topics identified: {len(builder.topics_map)}")
         click.echo()
         click.echo("Output Directories:")
-        click.echo(f"  • Metadata:    {scrape_dir}")
-        click.echo(f"  • Videos:      {download_dir}")
-        click.echo(f"  • Transcripts: {transcript_dir}")
-        click.echo(f"  • Markdown:    {markdown_dir}")
+        click.echo(f"  • Metadata:       {scrape_dir}")
+        click.echo(f"  • Videos:         {download_dir}")
+        click.echo(f"  • Transcripts:    {transcript_dir}")
+        click.echo(f"  • Markdown:       {markdown_dir}")
+        click.echo(f"  • Knowledge Base: {kb_dir}")
+        if zip_path:
+            click.echo(f"  • ZIP Archive:    {zip_path}")
         click.echo()
 
         # Show warnings if any stage had failures
