@@ -1,0 +1,53 @@
+# Instagram Reels Knowledge Base Creator - Configuration Template
+# Copy this file to config.yaml and customize as needed
+
+# Instagram settings
+instagram:
+  username: null  # Optional: Instagram username for authentication
+  password: null  # Optional: Instagram password (use environment variable instead)
+  rate_limit_delay: 2  # Seconds to wait between requests (avoid rate limiting)
+  session_file: session.json  # File to store Instagram session cookies
+
+# Download settings
+download:
+  max_workers: 3  # Number of concurrent download workers
+  retry_count: 3  # Number of retry attempts for failed downloads
+  retry_delay: 5  # Initial delay in seconds for retry (exponential backoff)
+  output_dir: ./output/downloads  # Directory to save downloaded videos
+  skip_existing: true  # Skip already downloaded videos
+  video_quality: best  # Video quality: best, high, medium, low
+
+# Transcription settings
+transcription:
+  service: openai  # Service to use: openai, whisper-local
+  model: whisper-1  # Model to use (OpenAI: whisper-1, Local: base, small, medium, large)
+  language: auto  # Language code: auto, en, tr, es, fr, de, etc.
+  output_dir: ./output/transcripts  # Directory to save transcripts
+  include_timestamps: true  # Include timestamps in transcripts
+  max_workers: 2  # Number of concurrent transcription workers
+
+# Content processing settings
+processing:
+  ai_service: gemini  # AI service for summarization: gemini, openai
+  ai_model: gemini-2.0-flash-exp  # Model: gemini-2.0-flash-exp, gpt-4o-mini, gpt-4
+  template: default  # Template name: default, detailed, minimal
+  output_dir: ./output/markdown  # Directory to save markdown files
+  extract_topics: true  # Extract topics from content
+  generate_summary: true  # Generate AI summary
+  max_summary_length: 500  # Maximum summary length in words
+
+# Knowledge base settings
+knowledge_base:
+  base_dir: ./output/knowledge-base  # Base directory for knowledge base
+  create_index: true  # Create master index.md
+  organize_by_topic: true  # Organize files by detected topics
+  create_zip: false  # Create ZIP archive for NotebookLM import
+  zip_name: knowledge-base.zip  # Name of ZIP archive
+
+# General settings
+general:
+  log_level: INFO  # Log level: DEBUG, INFO, WARNING, ERROR
+  log_file: ./output/reels_scraper.log  # Log file path
+  progress_bars: true  # Show progress bars
+  verbose: false  # Verbose output
+  dry_run: false  # Dry run mode (preview without executing)
