@@ -1,0 +1,49 @@
+# {{ title }}
+
+**Profile**: @{{ metadata.profile }}
+**Date**: {{ metadata.date }}
+**Duration**: {{ metadata.duration }}
+**URL**: [{{ metadata.url }}]({{ metadata.url }})
+**Views**: {{ metadata.views|default('N/A') }}
+**Likes**: {{ metadata.likes|default('N/A') }}
+
+---
+
+## Executive Summary
+
+{{ summary }}
+
+---
+
+## Full Transcript
+
+{{ formatted_transcript }}
+
+---
+
+## Key Takeaways
+
+{% if key_points %}
+{% for point in key_points %}
+- {{ point }}
+{% endfor %}
+{% else %}
+No key takeaways extracted.
+{% endif %}
+
+---
+
+## Topics
+
+{% if topics %}
+{% for topic in topics %}#{{ topic }} {% endfor %}
+{% else %}
+No topics extracted.
+{% endif %}
+
+---
+
+**Language**: {{ language }}
+**Word Count**: {{ word_count }}
+**Transcription Service**: {{ service }}
+**Generated**: {{ generated_at }}

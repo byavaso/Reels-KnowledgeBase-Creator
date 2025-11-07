@@ -1,0 +1,694 @@
+"""Main CLI interface for Instagram Reels Knowledge Base Creator."""
+
+from pathlib import Path
+from typing import Optional
+
+import click
+from dotenv import load_dotenv
+
+from .. import __version__
+from ..config import get_config
+from ..logger import get_logger, setup_logger
+
+# Load environment variables
+load_dotenv()
+
+
+@click.group()
+@click.version_option(version=__version__)
+@click.option(
+    "--config",
+    "-c",
+    type=click.Path(exists=True, path_type=Path),
+    help="Path to configuration file",
+)
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+@click.pass_context
+def cli(ctx: click.Context, config: Optional[Path], verbose: bool) -> None:
+    """Instagram Reels Knowledge Base Creator.
+
+    Extract, transcribe, and organize Instagram Reels into structured knowledge bases.
+    """
+    # Load configuration
+    ctx.ensure_object(dict)
+    ctx.obj["config"] = get_config(config)
+
+    # Setup logging
+    logger = setup_logger(config=ctx.obj["config"], verbose=verbose)
+    ctx.obj["logger"] = logger
+
+    if verbose:
+        logger.debug("Verbose mode enabled")
+
+
+@cli.command()
+@click.argument("profile")
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(path_type=Path),
+    default=Path("./output"),
+    help="Output directory for metadata",
+)
+@click.option(
+    "--limit", "-l", type=int, default=None, help="Maximum number of Reels to scrape"
+)
+@click.option(
+    "--username", "-u", type=str, default=None, help="Instagram username for authentication"
+)
+@click.option(
+    "--password", "-p", type=str, default=None, help="Instagram password for authentication"
+)
+@click.pass_context
+def scrape(
+    ctx: click.Context,
+    profile: str,
+    output_dir: Path,
+    limit: Optional[int],
+    username: Optional[str],
+    password: Optional[str],
+) -> None:
+    """Scrape Instagram profile for Reels.
+
+    PROFILE: Instagram profile username or URL
+    """
+    from ..scraper import InstagramScraper
+
+    config = ctx.obj["config"]
+    logger = ctx.obj["logger"]
+
+    # Extract username from URL if needed
+    if "instagram.com" in profile:
+        # Extract username from URL like https://www.instagram.com/username/
+        parts = profile.rstrip("/").split("/")
+        target_username = parts[-1]
+    else:
+        target_username = profile
+
+    logger.info(f"Starting scraping for profile: {target_username}")
+
+    # Use credentials from config if not provided
+    if not username:
+        username = config.instagram.username
+    if not password:
+        password = config.instagram.password
+
+    try:
+        # Create scraper
+        scraper = InstagramScraper(
+            username=target_username,
+            instagram_username=username,
+            instagram_password=password,
+            rate_limit_delay=config.instagram.rate_limit_delay,
+            session_file=Path(config.instagram.session_file),
+        )
+
+        # Run scraping with progress bar
+        with click.progressbar(
+            length=limit or 100,
+            label=f"Scraping @{target_username}",
+            show_eta=True,
+        ) as bar:
+            profile_metadata, reels = scraper.scrape_profile(limit=limit, output_dir=output_dir)
+            bar.update(len(reels))
+
+        # Display summary
+        click.echo()
+        click.secho("✓ Scraping complete!", fg="green", bold=True)
+        click.echo(f"\nProfile: @{profile_metadata.username}")
+        click.echo(f"Full name: {profile_metadata.full_name}")
+        click.echo(f"Followers: {profile_metadata.follower_count:,}")
+        click.echo(f"Total posts: {profile_metadata.post_count:,}")
+        click.echo(f"\nReels found: {len(reels)}")
+        click.echo(f"Output directory: {output_dir}")
+        click.echo(f"\nMetadata saved to:")
+        click.echo(f"  - {output_dir}/profile_metadata.json")
+        click.echo(f"  - {output_dir}/reels_list.json")
+
+    except ValueError as e:
+        click.secho(f"✗ Error: {e}", fg="red", err=True)
+        ctx.exit(1)
+    except Exception as e:
+        logger.exception("Scraping failed")
+        click.secho(f"✗ Scraping failed: {e}", fg="red", err=True)
+        ctx.exit(1)
+
+
+@cli.command()
+@click.option(
+    "--input-json",
+    "-i",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Path to reels_list.json file",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output directory for downloads",
+)
+@click.option("--workers", "-w", type=int, default=3, help="Number of concurrent workers")
+@click.option("--skip-existing/--no-skip", default=True, help="Skip already downloaded videos")
+@click.pass_context
+def download(
+    ctx: click.Context,
+    input_json: Path,
+    output_dir: Optional[Path],
+    workers: int,
+    skip_existing: bool,
+) -> None:
+    """Download videos from scraped metadata.
+
+    Requires a reels_list.json file generated by the scrape command.
+    """
+    from ..downloader import VideoDownloader, load_reels_from_json
+
+    config = ctx.obj["config"]
+    logger = ctx.obj["logger"]
+
+    # Use config output dir if not specified
+    if not output_dir:
+        output_dir = config.download.output_dir
+
+    logger.info(f"Loading Reels metadata from {input_json}")
+
+    try:
+        # Load Reels metadata
+        reels = load_reels_from_json(input_json)
+
+        if not reels:
+            click.secho("✗ No Reels found in metadata file", fg="red", err=True)
+            ctx.exit(1)
+
+        click.echo(f"Found {len(reels)} Reels to download")
+
+        # Create downloader
+        downloader = VideoDownloader(
+            max_workers=workers,
+            retry_count=config.download.retry_count,
+            retry_delay=config.download.retry_delay,
+            output_dir=output_dir,
+            skip_existing=skip_existing,
+        )
+
+        # Download videos
+        report = downloader.download_batch(reels, show_progress=True)
+
+        # Save report
+        report_path = output_dir / "download_report.json"
+        downloader.save_download_report(report, report_path)
+
+        # Display summary
+        click.echo()
+        click.secho("✓ Download complete!", fg="green", bold=True)
+        click.echo(f"\nTotal videos: {report.total_videos}")
+        click.echo(f"Successful: {report.successful}")
+        click.echo(f"Failed: {report.failed}")
+        click.echo(f"Skipped: {report.skipped}")
+        click.echo(
+            f"Total size: {report.total_size / 1024 / 1024:.2f} MB"
+        )
+        click.echo(f"Total time: {report.total_time:.1f}s")
+        click.echo(f"\nVideos saved to: {output_dir}")
+        click.echo(f"Report saved to: {report_path}")
+
+        if report.failed > 0:
+            click.echo()
+            click.secho(f"⚠ {report.failed} videos failed to download", fg="yellow")
+            click.echo("Check the download report for details")
+
+    except Exception as e:
+        logger.exception("Download failed")
+        click.secho(f"✗ Download failed: {e}", fg="red", err=True)
+        ctx.exit(1)
+
+
+@cli.command()
+@click.option(
+    "--video-dir",
+    "-v",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Directory containing videos",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output directory for transcripts",
+)
+@click.option("--language", "-l", type=str, default="auto", help="Language code or 'auto'")
+@click.option("--workers", "-w", type=int, default=2, help="Number of concurrent workers")
+@click.pass_context
+def transcribe(
+    ctx: click.Context,
+    video_dir: Path,
+    output_dir: Optional[Path],
+    language: str,
+    workers: int,
+) -> None:
+    """Transcribe videos using Whisper API."""
+    from ..transcription import TranscriptionEngine, get_video_files_from_directory
+
+    config = ctx.obj["config"]
+    logger = ctx.obj["logger"]
+
+    # Use config output dir if not specified
+    if not output_dir:
+        output_dir = config.transcription.output_dir
+
+    # Validate API key
+    if not config.openai_api_key:
+        click.secho("✗ Error: OPENAI_API_KEY environment variable not set", fg="red", err=True)
+        click.echo("\nPlease set your OpenAI API key:")
+        click.echo("  export OPENAI_API_KEY=sk-your-key-here")
+        ctx.exit(1)
+
+    logger.info(f"Loading videos from {video_dir}")
+
+    try:
+        # Get video files
+        video_files = get_video_files_from_directory(video_dir)
+
+        if not video_files:
+            click.secho("✗ No video files found in directory", fg="red", err=True)
+            ctx.exit(1)
+
+        click.echo(f"Found {len(video_files)} videos to transcribe")
+
+        # Create transcription engine
+        engine = TranscriptionEngine(
+            api_key=config.openai_api_key,
+            model=config.transcription.model,
+            language=language,
+            max_workers=workers,
+            include_timestamps=config.transcription.include_timestamps,
+        )
+
+        # Transcribe videos
+        transcripts = engine.transcribe_batch(
+            video_files, show_progress=True, cleanup_audio=True
+        )
+
+        # Save transcripts
+        engine.save_transcripts(transcripts, output_dir)
+
+        # Display summary
+        click.echo()
+        click.secho("✓ Transcription complete!", fg="green", bold=True)
+        click.echo(f"\nTotal videos: {len(video_files)}")
+        click.echo(f"Successfully transcribed: {len(transcripts)}")
+        click.echo(f"Failed: {len(video_files) - len(transcripts)}")
+
+        if transcripts:
+            total_words = sum(t.word_count for t in transcripts)
+            total_duration = sum(t.duration for t in transcripts)
+            languages = set(t.language for t in transcripts)
+
+            click.echo(f"\nTotal words: {total_words:,}")
+            click.echo(f"Total duration: {total_duration / 60:.1f} minutes")
+            click.echo(f"Languages detected: {', '.join(languages)}")
+
+        click.echo(f"\nTranscripts saved to: {output_dir}")
+
+        if len(transcripts) < len(video_files):
+            click.echo()
+            click.secho(
+                f"⚠ {len(video_files) - len(transcripts)} videos failed to transcribe",
+                fg="yellow",
+            )
+            click.echo("Check logs for details")
+
+    except Exception as e:
+        logger.exception("Transcription failed")
+        click.secho(f"✗ Transcription failed: {e}", fg="red", err=True)
+        ctx.exit(1)
+
+
+@cli.command()
+@click.option(
+    "--transcript-dir",
+    "-t",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Directory containing transcripts",
+)
+@click.option(
+    "--reels-json",
+    "-r",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Optional reels_list.json file for metadata",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output directory for markdown files",
+)
+@click.pass_context
+def generate(
+    ctx: click.Context,
+    transcript_dir: Path,
+    reels_json: Optional[Path],
+    output_dir: Optional[Path],
+) -> None:
+    """Generate markdown reports from transcripts."""
+    from ..processor import (
+        ContentProcessor,
+        load_reel_metadata_from_json,
+        load_transcripts_from_directory,
+    )
+
+    config = ctx.obj["config"]
+    logger = ctx.obj["logger"]
+
+    # Use config output dir if not specified
+    if not output_dir:
+        output_dir = config.processing.output_dir
+
+    # Validate API key
+    if not config.google_api_key:
+        click.secho("✗ Error: GOOGLE_API_KEY environment variable not set", fg="red", err=True)
+        click.echo("\nPlease set your Google API key:")
+        click.echo("  export GOOGLE_API_KEY=your-key-here")
+        ctx.exit(1)
+
+    logger.info(f"Loading transcripts from {transcript_dir}")
+
+    try:
+        # Load transcripts
+        transcripts = load_transcripts_from_directory(transcript_dir)
+
+        if not transcripts:
+            click.secho("✗ No transcripts found in directory", fg="red", err=True)
+            ctx.exit(1)
+
+        click.echo(f"Found {len(transcripts)} transcripts to process")
+
+        # Load reel metadata if provided
+        reels_metadata = None
+        if reels_json:
+            logger.info(f"Loading reel metadata from {reels_json}")
+            reels_metadata = load_reel_metadata_from_json(reels_json)
+            click.echo(f"Loaded metadata for {len(reels_metadata)} reels")
+
+        # Create content processor
+        processor = ContentProcessor(
+            google_api_key=config.google_api_key,
+            ai_model=config.processing.ai_model,
+            template=config.processing.template,
+            max_summary_length=config.processing.max_summary_length,
+            extract_topics=config.processing.extract_topics,
+            generate_summary=config.processing.generate_summary,
+        )
+
+        # Process transcripts
+        reports = processor.process_batch(
+            transcripts, reels_metadata=reels_metadata, show_progress=True
+        )
+
+        # Save markdown reports
+        saved_paths = processor.save_reports(reports, output_dir)
+
+        # Display summary
+        click.echo()
+        click.secho("✓ Generation complete!", fg="green", bold=True)
+        click.echo(f"\nTotal transcripts: {len(transcripts)}")
+        click.echo(f"Successfully generated: {len(reports)}")
+        click.echo(f"Failed: {len(transcripts) - len(reports)}")
+        click.echo(f"\nMarkdown files saved to: {output_dir}")
+
+        if len(reports) < len(transcripts):
+            click.echo()
+            click.secho(
+                f"⚠ {len(transcripts) - len(reports)} transcripts failed to process",
+                fg="yellow",
+            )
+            click.echo("Check logs for details")
+
+    except Exception as e:
+        logger.exception("Generation failed")
+        click.secho(f"✗ Generation failed: {e}", fg="red", err=True)
+        ctx.exit(1)
+
+
+@cli.command()
+@click.option(
+    "--markdown-dir",
+    "-m",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Directory containing markdown files",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output directory for knowledge base",
+)
+@click.pass_context
+def index(
+    ctx: click.Context,
+    markdown_dir: Path,
+    output_dir: Optional[Path],
+) -> None:
+    """Build knowledge base index from markdown files."""
+    logger = ctx.obj["logger"]
+    click.secho("Index command not yet implemented", fg="yellow")
+    logger.warning("Index functionality coming in Phase 6")
+
+
+@cli.command()
+@click.argument("profile")
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(path_type=Path),
+    default=Path("./output"),
+    help="Output directory",
+)
+@click.option("--limit", "-l", type=int, default=None, help="Maximum number of Reels to process")
+@click.option("--workers", "-w", type=int, default=3, help="Number of concurrent download workers")
+@click.option(
+    "--skip-existing", is_flag=True, default=True, help="Skip already downloaded/processed files"
+)
+@click.pass_context
+def full(
+    ctx: click.Context,
+    profile: str,
+    output_dir: Path,
+    limit: Optional[int],
+    workers: int,
+    skip_existing: bool,
+) -> None:
+    """Run complete pipeline: scrape → download → transcribe → generate.
+
+    This command runs all stages of the pipeline sequentially:
+    1. Scrape Instagram profile for Reels metadata
+    2. Download videos
+    3. Transcribe videos using Whisper API
+    4. Generate markdown reports with AI enhancement
+    """
+    from ..downloader import VideoDownloader
+    from ..processor import ContentProcessor, load_reel_metadata_from_json
+    from ..scraper import InstagramScraper
+    from ..transcription import TranscriptionEngine, get_video_files_from_directory
+
+    config = ctx.obj["config"]
+    logger = ctx.obj["logger"]
+
+    # Validate API keys
+    if not config.openai_api_key:
+        click.secho("✗ Error: OPENAI_API_KEY environment variable not set", fg="red", err=True)
+        click.echo("\nPlease set your OpenAI API key:")
+        click.echo("  export OPENAI_API_KEY=sk-your-key-here")
+        ctx.exit(1)
+
+    if not config.google_api_key:
+        click.secho("✗ Error: GOOGLE_API_KEY environment variable not set", fg="red", err=True)
+        click.echo("\nPlease set your Google API key:")
+        click.echo("  export GOOGLE_API_KEY=your-key-here")
+        ctx.exit(1)
+
+    # Extract username from URL if needed
+    if "instagram.com" in profile:
+        parts = profile.rstrip("/").split("/")
+        target_username = parts[-1]
+    else:
+        target_username = profile
+
+    # Setup output directories
+    scrape_dir = output_dir
+    download_dir = output_dir / "downloads"
+    transcript_dir = output_dir / "transcripts"
+    markdown_dir = output_dir / "markdown"
+
+    click.echo()
+    click.secho("=" * 70, fg="cyan")
+    click.secho("  Instagram Reels Knowledge Base Creator - Full Pipeline", fg="cyan", bold=True)
+    click.secho("=" * 70, fg="cyan")
+    click.echo(f"\nProfile: @{target_username}")
+    click.echo(f"Output: {output_dir}")
+    if limit:
+        click.echo(f"Limit: {limit} Reels")
+    click.echo()
+
+    try:
+        # ==================== STAGE 1: SCRAPING ====================
+        click.secho("Stage 1: Scraping Instagram Profile", fg="blue", bold=True)
+        click.echo("-" * 50)
+
+        scraper = InstagramScraper(
+            username=target_username,
+            instagram_username=config.instagram.username,
+            instagram_password=config.instagram.password,
+            rate_limit_delay=config.instagram.rate_limit_delay,
+            session_file=Path(config.instagram.session_file),
+        )
+
+        profile_metadata, reels = scraper.scrape_profile(limit=limit, output_dir=scrape_dir)
+
+        click.secho(f"✓ Scraped {len(reels)} Reels from @{profile_metadata.username}", fg="green")
+        click.echo()
+
+        if not reels:
+            click.secho("✗ No Reels found to process", fg="red")
+            ctx.exit(1)
+
+        # ==================== STAGE 2: DOWNLOADING ====================
+        click.secho("Stage 2: Downloading Videos", fg="blue", bold=True)
+        click.echo("-" * 50)
+
+        downloader = VideoDownloader(
+            max_workers=workers,
+            retry_count=config.download.retry_count,
+            retry_delay=config.download.retry_delay,
+            output_dir=download_dir,
+            skip_existing=skip_existing,
+        )
+
+        download_report = downloader.download_batch(reels, show_progress=True)
+
+        click.secho(
+            f"✓ Downloaded {download_report.successful} videos "
+            f"({download_report.total_size / 1024 / 1024:.2f} MB)",
+            fg="green",
+        )
+        click.echo()
+
+        if download_report.successful == 0:
+            click.secho("✗ No videos were downloaded successfully", fg="red")
+            ctx.exit(1)
+
+        # ==================== STAGE 3: TRANSCRIPTION ====================
+        click.secho("Stage 3: Transcribing Videos", fg="blue", bold=True)
+        click.echo("-" * 50)
+
+        video_files = get_video_files_from_directory(download_dir)
+
+        transcription_engine = TranscriptionEngine(
+            api_key=config.openai_api_key,
+            model=config.transcription.model,
+            language=config.transcription.language,
+            max_workers=config.transcription.max_workers,
+            include_timestamps=config.transcription.include_timestamps,
+        )
+
+        transcripts = transcription_engine.transcribe_batch(
+            video_files, show_progress=True, cleanup_audio=True
+        )
+
+        transcription_engine.save_transcripts(transcripts, transcript_dir)
+
+        click.secho(f"✓ Transcribed {len(transcripts)} videos", fg="green")
+        click.echo()
+
+        if not transcripts:
+            click.secho("✗ No transcripts were generated", fg="red")
+            ctx.exit(1)
+
+        # ==================== STAGE 4: MARKDOWN GENERATION ====================
+        click.secho("Stage 4: Generating Markdown Reports", fg="blue", bold=True)
+        click.echo("-" * 50)
+
+        reels_metadata = {reel.video_id: reel for reel in reels}
+
+        processor = ContentProcessor(
+            google_api_key=config.google_api_key,
+            ai_model=config.processing.ai_model,
+            template=config.processing.template,
+            max_summary_length=config.processing.max_summary_length,
+            extract_topics=config.processing.extract_topics,
+            generate_summary=config.processing.generate_summary,
+        )
+
+        reports = processor.process_batch(
+            transcripts, reels_metadata=reels_metadata, show_progress=True
+        )
+
+        processor.save_reports(reports, markdown_dir)
+
+        click.secho(f"✓ Generated {len(reports)} markdown reports", fg="green")
+        click.echo()
+
+        # ==================== FINAL SUMMARY ====================
+        click.echo()
+        click.secho("=" * 70, fg="cyan")
+        click.secho("  Pipeline Complete!", fg="green", bold=True)
+        click.secho("=" * 70, fg="cyan")
+        click.echo()
+        click.echo(f"Profile: @{profile_metadata.username} ({profile_metadata.full_name})")
+        click.echo(f"Followers: {profile_metadata.follower_count:,}")
+        click.echo()
+        click.echo("Pipeline Results:")
+        click.echo(f"  • Reels discovered:  {len(reels)}")
+        click.echo(f"  • Videos downloaded: {download_report.successful}")
+        click.echo(f"  • Transcripts:       {len(transcripts)}")
+        click.echo(f"  • Markdown reports:  {len(reports)}")
+        click.echo()
+        click.echo("Output Directories:")
+        click.echo(f"  • Metadata:    {scrape_dir}")
+        click.echo(f"  • Videos:      {download_dir}")
+        click.echo(f"  • Transcripts: {transcript_dir}")
+        click.echo(f"  • Markdown:    {markdown_dir}")
+        click.echo()
+
+        # Show warnings if any stage had failures
+        warnings = []
+        if download_report.failed > 0:
+            warnings.append(f"{download_report.failed} videos failed to download")
+        if len(transcripts) < download_report.successful:
+            warnings.append(
+                f"{download_report.successful - len(transcripts)} videos failed to transcribe"
+            )
+        if len(reports) < len(transcripts):
+            warnings.append(f"{len(transcripts) - len(reports)} transcripts failed to process")
+
+        if warnings:
+            click.secho("⚠ Warnings:", fg="yellow", bold=True)
+            for warning in warnings:
+                click.echo(f"  • {warning}")
+            click.echo()
+
+        click.secho("✓ Knowledge base created successfully!", fg="green", bold=True)
+        click.echo()
+
+    except KeyboardInterrupt:
+        click.echo()
+        click.secho("✗ Pipeline interrupted by user", fg="red")
+        ctx.exit(130)
+    except Exception as e:
+        logger.exception("Pipeline failed")
+        click.echo()
+        click.secho(f"✗ Pipeline failed: {e}", fg="red", err=True)
+        ctx.exit(1)
+
+
+if __name__ == "__main__":
+    cli()
